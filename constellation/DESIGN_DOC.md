@@ -29,6 +29,9 @@ Each task can be OPTIONALLY directed to flow to another task.
 
 Prepopulate this board with a few sample tasks.
 
+Add a button to the task board list to import a task list from Microsoft Planner. Planner exports a task board as an 
+`.xlsx`, see the sample version in this repo `Tasks.xlsx`.
+
 ### Technical Details
 
 Try and pull a list of task boards from the endpoint `/boards`

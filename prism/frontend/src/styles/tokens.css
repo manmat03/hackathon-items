@@ -1,0 +1,27 @@
+/* Horizon brief — design tokens. Mirrors prism-directions artifact. */
+:root {
+  /* Ground */
+  --paper: #ffffff;
+  --paper-cool: #f4f6fa;
+
+  /* Protiviti navy family */
+  --navy: #002d4d;
+  --navy-deep: #002140;
+  --navy-mid: #3c557a;
+  --navy-soft: #8da3c0;
+  --navy-faint: #d8dfe8;
+  --rule: #d8dee6;
+
+  /* Lumo highlight */
+  --lumo-highlight: #5c8acc;
+
+  /* The single sunrise moment (results peak only) */
+  --sun: #e8923c;
+  --sun-glow: rgba(232, 146, 60, 0.25);
+
+  /* Faces */
+  --font-display: "Spectral", "Charter", Georgia, serif;
+  --font-sans: "Figtree", ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  color-scheme: light;
+}

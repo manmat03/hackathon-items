@@ -5,6 +5,7 @@ from enum import Enum
 from azure.identity import InteractiveBrowserCredential, get_bearer_token_provider
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from openai import AzureOpenAI
 from pydantic import BaseModel
 
@@ -68,6 +69,13 @@ model = "gpt-4-1-20250414-gs"
 
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 def main():
     skills = gen_default_skill_list()
@@ -99,6 +107,7 @@ def eval_description(work_description: str):
     if updated_list is None:
         raise ValueError()
     write_skills(updated_list.skills)
+    return updated_list
 
 
 def update_user_skill(skill_name: str, skill_level: int):

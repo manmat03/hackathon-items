@@ -1,7 +1,7 @@
 import { Component } from "solid-js";
 import { useNavigate } from "@solidjs/router";
 import { Lumo } from "../components/Lumo";
-import { setTranscript, setResult } from "../lib/store";
+import { setHistory, setResult } from "../lib/store";
 import { ttsSupported, sttSupported } from "../lib/speech";
 import "./Welcome.css";
 
@@ -10,7 +10,7 @@ const Welcome: Component = () => {
   const canVoice = ttsSupported() && sttSupported();
 
   const begin = () => {
-    setTranscript([]);
+    setHistory([]);
     setResult(null);
     nav("/interview");
   };

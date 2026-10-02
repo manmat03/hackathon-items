@@ -58,6 +58,13 @@ export interface SkillList {
   skills: Skill[];
 }
 
+export interface InterviewMessage {
+  role: "lumo" | "user";
+  content: string;
+}
+
+/** Legacy pair-shape, kept so the /eval call can thread Q/A labels into
+ *  the single-paragraph work_description the backend currently accepts. */
 export interface Turn {
   question: string;
   answer: string;

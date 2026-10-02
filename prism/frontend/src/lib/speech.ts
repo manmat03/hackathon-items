@@ -17,7 +17,7 @@ export const sttSupported = () =>
   !!(window.SpeechRecognition || window.webkitSpeechRecognition);
 
 export function speak(text: string, onEnd?: () => void): () => void {
-  if (!ttsSupported()) {
+  if (!ttsSupported() || !text.trim()) {
     onEnd?.();
     return () => {};
   }
@@ -29,6 +29,75 @@ export function speak(text: string, onEnd?: () => void): () => void {
   window.speechSynthesis.cancel();
   window.speechSynthesis.speak(utter);
   return () => window.speechSynthesis.cancel();
+}
+
+/** Streaming speaker. Accepts tokens as they arrive, speaks each complete
+ *  sentence immediately via the browser's TTS queue. Caller signals end
+ *  of stream with .finish(); calls onComplete after the final sentence
+ *  has finished playing. Cancel at any time with .cancel().
+ */
+export function streamingSpeaker(onComplete?: () => void) {
+  if (!ttsSupported()) {
+    return {
+      push: (_: string) => {},
+      finish: () => onComplete?.(),
+      cancel: () => {},
+    };
+  }
+
+  let buffer = "";
+  let finished = false;
+  let inFlight = 0;
+
+  const flushSentence = (sentence: string) => {
+    const text = sentence.trim();
+    if (!text) return;
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.rate = 0.98;
+    utter.pitch = 1.0;
+    utter.lang = "en-US";
+    inFlight++;
+    utter.onend = () => {
+      inFlight--;
+      if (finished && inFlight === 0) onComplete?.();
+    };
+    utter.onerror = utter.onend;
+    window.speechSynthesis.speak(utter);
+  };
+
+  const drainReadySentences = () => {
+    // Split on sentence boundaries that are followed by a space or end of buffer.
+    const re = /([.!?]+)(\s+|$)/g;
+    let lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(buffer)) !== null) {
+      const end = match.index + match[1].length;
+      const sentence = buffer.slice(lastIndex, end);
+      flushSentence(sentence);
+      lastIndex = end + match[2].length;
+    }
+    buffer = buffer.slice(lastIndex);
+  };
+
+  return {
+    push(text: string) {
+      buffer += text;
+      drainReadySentences();
+    },
+    finish() {
+      finished = true;
+      if (buffer.trim()) {
+        flushSentence(buffer);
+        buffer = "";
+      }
+      if (inFlight === 0) onComplete?.();
+    },
+    cancel() {
+      finished = true;
+      buffer = "";
+      window.speechSynthesis.cancel();
+    },
+  };
 }
 
 export interface Listener {
@@ -46,7 +115,9 @@ export function listen(
     return { stop: () => {} };
   }
   const rec = new Ctor() as any;
-  rec.continuous = true;
+  // Non-continuous so the engine auto-ends on silence (built-in VAD).
+  // That's the natural turn boundary we want for Gemini-style conversation.
+  rec.continuous = false;
   rec.interimResults = false;
   rec.lang = "en-US";
 

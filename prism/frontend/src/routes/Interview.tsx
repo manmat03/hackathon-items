@@ -1,121 +1,194 @@
 import { Component, createSignal, onCleanup, onMount, Show } from "solid-js";
 import { useNavigate } from "@solidjs/router";
 import { Lumo, LumoState } from "../components/Lumo";
-import { LUMO_INTRO, LUMO_QUESTIONS } from "../lib/questions";
-import { listen, Listener, speak, sttSupported } from "../lib/speech";
-import { transcript, setTranscript, setResult } from "../lib/store";
-import { evalDescription, turnsToWorkDescription } from "../lib/api";
-import type { Turn } from "../lib/types";
+import { TranscriptPane } from "../components/TranscriptPane";
+import {
+  END_SENTINEL,
+  evalDescription,
+  historyToWorkDescription,
+  streamInterviewNext,
+  stripEndSentinel,
+} from "../lib/api";
+import {
+  listen,
+  Listener,
+  streamingSpeaker,
+  sttSupported,
+  ttsSupported,
+} from "../lib/speech";
+import { history, setHistory, setResult } from "../lib/store";
+import type { InterviewMessage } from "../lib/types";
+import { LUMO_FALLBACK_OPENER } from "../lib/questions";
 import "./Interview.css";
 
-type Phase = "intro" | "asking" | "listening" | "heard" | "finalizing" | "error";
+type Phase =
+  | "booting"
+  | "lumo-speaking"
+  | "listening"
+  | "finalizing"
+  | "error";
 
 const Interview: Component = () => {
   const nav = useNavigate();
 
-  const [index, setIndex] = createSignal(0);
-  const [phase, setPhase] = createSignal<Phase>("intro");
-  const [heardText, setHeardText] = createSignal("");
-  const [editing, setEditing] = createSignal(false);
+  const [phase, setPhase] = createSignal<Phase>("booting");
+  const [liveLumo, setLiveLumo] = createSignal("");
+  const [typedAnswer, setTypedAnswer] = createSignal("");
   const [errorMsg, setErrorMsg] = createSignal<string | null>(null);
 
   let listener: Listener | null = null;
-  let cancelSpeak: (() => void) | null = null;
-
-  const currentQuestion = () => LUMO_QUESTIONS[index()] ?? "";
-  const total = LUMO_QUESTIONS.length;
+  let speaker: ReturnType<typeof streamingSpeaker> | null = null;
+  let cancelled = false;
 
   const lumoState = (): LumoState => {
     switch (phase()) {
-      case "asking": return "speaking";
-      case "listening": return "listening";
+      case "lumo-speaking":
+        return "speaking";
+      case "listening":
+        return "listening";
       case "finalizing":
-      case "heard": return "thinking";
-      default: return "idle";
+        return "thinking";
+      case "booting":
+        return "thinking";
+      default:
+        return "idle";
     }
   };
 
   onMount(() => {
-    // Play the intro, then move to the first question.
-    setPhase("asking");
-    cancelSpeak = speak(LUMO_INTRO, () => {
-      askCurrent();
-    });
+    runLumoTurn();
   });
 
   onCleanup(() => {
-    cancelSpeak?.();
+    cancelled = true;
     listener?.stop();
+    speaker?.cancel();
   });
 
-  const askCurrent = () => {
-    setPhase("asking");
-    cancelSpeak = speak(currentQuestion(), () => {
-      startListening();
-    });
-  };
+  /** Stream the next Lumo utterance, speak it as it arrives, then flow into
+   *  listening (unless the stream signaled wrap_up). */
+  const runLumoTurn = async () => {
+    if (cancelled) return;
+    setPhase("lumo-speaking");
+    setLiveLumo("");
 
-  const startListening = () => {
-    setPhase("listening");
-    if (!sttSupported()) {
-      // Fall back to type-in-place: user hits "Done talking" after typing.
-      return;
-    }
-    listener = listen(
-      (text) => {
-        listener = null;
-        setHeardText(text);
-        setPhase("heard");
-      },
-      (err) => {
-        listener = null;
-        setErrorMsg(`Microphone problem: ${err}. Type your answer instead.`);
-        setPhase("heard");
+    let full = "";
+    let wrapUp = false;
+
+    speaker = streamingSpeaker(() => {
+      // Called after the final sentence has finished playing.
+      if (cancelled) return;
+      const cleaned = stripEndSentinel(full);
+      setHistory([...history(), { role: "lumo", content: cleaned }]);
+      setLiveLumo("");
+      if (wrapUp) {
+        void finalize();
+      } else {
+        startListening();
       }
-    );
-  };
+    });
 
-  const stopListening = () => {
-    listener?.stop();
-    listener = null;
-  };
-
-  const confirmHeard = () => {
-    const answer = heardText().trim();
-    const turn: Turn = { question: currentQuestion(), answer };
-    setTranscript([...transcript(), turn]);
-    setHeardText("");
-    setEditing(false);
-    setErrorMsg(null);
-
-    if (index() + 1 >= total) {
-      finalize();
-    } else {
-      setIndex(index() + 1);
-      askCurrent();
-    }
-  };
-
-  const finalize = async () => {
-    setPhase("finalizing");
     try {
-      const desc = turnsToWorkDescription(transcript());
-      const result = await evalDescription(desc);
-      setResult(result);
-      nav("/results");
+      for await (const ev of streamInterviewNext(history())) {
+        if (cancelled) return;
+        if (ev.type === "token") {
+          full += ev.text;
+          const visible = stripEndSentinel(full);
+          setLiveLumo(visible);
+          // Feed the speaker a safe (sentinel-free) stream.
+          const safeDelta = ev.text.includes(END_SENTINEL)
+            ? ev.text.replace(END_SENTINEL, "")
+            : ev.text;
+          speaker.push(safeDelta);
+        } else if (ev.type === "done") {
+          wrapUp = ev.wrap_up;
+          speaker.finish();
+        } else if (ev.type === "error") {
+          throw new Error(ev.message);
+        }
+      }
     } catch (e) {
+      if (cancelled) return;
       console.error(e);
+      // On first-turn failure: fall back to the hard-coded opener so the user
+      // sees a friendly message instead of a blank screen.
+      if (history().length === 0) {
+        setHistory([{ role: "lumo", content: LUMO_FALLBACK_OPENER }]);
+      }
       setErrorMsg(
-        `Couldn't reach the backend (${e instanceof Error ? e.message : String(e)}). Is uvicorn running on :8000?`
+        `Lumo can't reach the backend — ${e instanceof Error ? e.message : String(e)}. ` +
+          `Make sure uvicorn is running on :8000, then click Retry.`
       );
       setPhase("error");
     }
   };
 
-  const skipAndFinalize = () => {
-    stopListening();
-    cancelSpeak?.();
-    finalize();
+  const startListening = () => {
+    if (cancelled) return;
+    setPhase("listening");
+    setTypedAnswer("");
+
+    if (!sttSupported()) {
+      // Fall back to text input; user clicks Submit when done.
+      return;
+    }
+    listener = listen(
+      (text) => {
+        listener = null;
+        if (!text.trim()) {
+          // Nothing heard; keep listening on the next tick.
+          startListening();
+          return;
+        }
+        pushUserTurn(text.trim());
+      },
+      (err) => {
+        listener = null;
+        setErrorMsg(`Microphone problem: ${err}. Type instead.`);
+      }
+    );
+  };
+
+  const submitTyped = () => {
+    const text = typedAnswer().trim();
+    if (!text) return;
+    setTypedAnswer("");
+    pushUserTurn(text);
+  };
+
+  const pushUserTurn = (text: string) => {
+    const next: InterviewMessage[] = [
+      ...history(),
+      { role: "user", content: text },
+    ];
+    setHistory(next);
+    void runLumoTurn();
+  };
+
+  const finalize = async () => {
+    setPhase("finalizing");
+    try {
+      const desc = historyToWorkDescription(history());
+      const r = await evalDescription(desc);
+      setResult(r);
+      nav("/results");
+    } catch (e) {
+      setErrorMsg(
+        `Couldn't finalize the reading — ${e instanceof Error ? e.message : String(e)}.`
+      );
+      setPhase("error");
+    }
+  };
+
+  const wrapNow = () => {
+    speaker?.cancel();
+    listener?.stop();
+    void finalize();
+  };
+
+  const retry = () => {
+    setErrorMsg(null);
+    runLumoTurn();
   };
 
   return (
@@ -124,111 +197,99 @@ const Interview: Component = () => {
         <div class="word">
           Prism<span class="dot" aria-hidden="true" />
         </div>
-        <div class="interview-mid">
-          A conversation with Lumo · {index() + 1} / {total}
-        </div>
+        <div class="interview-mid">A conversation with Lumo</div>
         <div class="interview-right">
-          <button class="link" onClick={skipAndFinalize}>Finish early →</button>
+          <button class="link" onClick={wrapNow}>
+            Wrap up →
+          </button>
         </div>
       </header>
 
-      <section class="interview-stage">
-        <div class="eyebrow">
-          <span class="lumo-dot" />
-          <span><b>Lumo</b> · question {index() + 1} of {total}</span>
-        </div>
+      <div class="interview-body">
+        <section class="interview-stage">
+          <div class="eyebrow">
+            <span class="lumo-dot" />
+            <span>
+              <b>Lumo</b> · {phaseLabel(phase())}
+            </span>
+          </div>
 
-        <p class="prompt">{currentQuestion()}</p>
+          <Show when={liveLumo()}>
+            <p class="prompt">{liveLumo()}</p>
+          </Show>
+          <Show when={!liveLumo() && phase() !== "error"}>
+            <p class="prompt subtle">
+              {phase() === "listening"
+                ? sttSupported()
+                  ? "Take your time — I'm listening."
+                  : "Type your answer below when you're ready."
+                : phase() === "finalizing"
+                  ? "Reading everything you shared…"
+                  : "Just a moment."}
+            </p>
+          </Show>
 
-        <Lumo state={lumoState()} size={110} label={`Lumo · ${lumoLabel(phase())}`} />
+          <Lumo state={lumoState()} size={120} label={`Lumo · ${phaseLabel(phase())}`} />
 
-        <Show when={phase() === "heard" || editing()}>
-          <div class="heard">
-            <div class="heard-eyebrow">I heard that →</div>
-            {editing() ? (
+          <Show when={phase() === "listening" && !sttSupported()}>
+            <div class="typed">
               <textarea
-                class="heard-edit"
-                value={heardText()}
-                onInput={(e) => setHeardText(e.currentTarget.value)}
+                class="typed-input"
+                value={typedAnswer()}
+                onInput={(e) => setTypedAnswer(e.currentTarget.value)}
+                placeholder="Type your answer here, then press Enter."
                 rows={3}
                 autofocus
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    submitTyped();
+                  }
+                }}
               />
-            ) : (
-              <p class="heard-text">
-                {heardText() || <span class="muted">— nothing yet; try typing it in.</span>}
-              </p>
-            )}
-            <div class="heard-row">
-              <button class="link" onClick={() => setEditing(!editing())}>
-                {editing() ? "Done editing" : "Something wrong? Edit"}
-              </button>
-              <button class="confirm" onClick={confirmHeard}>
-                {index() + 1 >= total ? "Finish →" : "Sounds right →"}
+              <button class="confirm" onClick={submitTyped}>
+                Send
               </button>
             </div>
-          </div>
-        </Show>
+          </Show>
 
-        <Show when={phase() === "listening"}>
-          <div class="listening-note">
-            Take your time. {sttSupported()
-              ? "Lumo is listening. Pause when you're done; I'll show what I heard."
-              : "Your browser doesn't do voice — type below and submit."}
-          </div>
-          {!sttSupported() && (
-            <div class="heard">
-              <textarea
-                class="heard-edit"
-                placeholder="Type your answer here, then press Submit."
-                value={heardText()}
-                onInput={(e) => setHeardText(e.currentTarget.value)}
-                rows={3}
-              />
-              <div class="heard-row">
-                <span />
-                <button class="confirm" onClick={() => setPhase("heard")}>
-                  Submit →
-                </button>
-              </div>
-            </div>
-          )}
-          {sttSupported() && (
-            <button class="link stop" onClick={() => {
-              stopListening();
-            }}>
-              I'm done — show what you heard
+          <Show when={phase() === "error" && errorMsg()}>
+            <div class="error">{errorMsg()}</div>
+            <button class="confirm" onClick={retry}>
+              Retry
             </button>
-          )}
-        </Show>
+          </Show>
+        </section>
 
-        <Show when={phase() === "finalizing"}>
-          <div class="listening-note">
-            Lumo is reading everything you shared and making your profile…
-          </div>
-        </Show>
-
-        <Show when={phase() === "error" && errorMsg()}>
-          <div class="error">{errorMsg()}</div>
-          <button class="confirm" onClick={finalize}>Try again</button>
-        </Show>
-      </section>
+        <TranscriptPane messages={history()} liveLumo={liveLumo()} />
+      </div>
 
       <footer class="interview-foot">
-        <span>Lumo asks real follow-ups. No scoring on screen while you talk.</span>
+        <span>No scoring on screen. Lumo decides when we've covered enough.</span>
       </footer>
     </main>
   );
 };
 
-function lumoLabel(p: Phase): string {
+function phaseLabel(p: Phase): string {
   switch (p) {
-    case "asking": return "speaking";
-    case "listening": return "listening";
-    case "heard": return "ready";
-    case "finalizing": return "thinking";
-    case "error": return "stuck";
-    default: return "idle";
+    case "lumo-speaking":
+      return "speaking";
+    case "listening":
+      return "listening";
+    case "finalizing":
+      return "thinking";
+    case "booting":
+      return "warming up";
+    case "error":
+      return "stuck";
+    default:
+      return "idle";
   }
 }
+
+// Silence unused-import warning for ttsSupported (kept available if a future
+// turn needs to branch on TTS availability).
+void ttsSupported;
 
 export default Interview;

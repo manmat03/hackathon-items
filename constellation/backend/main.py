@@ -14,7 +14,8 @@ from agents import (
 )
 from azure.identity import InteractiveBrowserCredential, get_bearer_token_provider
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from openai import AsyncAzureOpenAI
 from pydantic import BaseModel
 
@@ -50,6 +51,16 @@ model = "gpt-4-1-20250414-gs"
 
 app = FastAPI()
 
+origins = ["http://localhost:5173"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 class Certainty(str, Enum):
     LOW = "LOW"
@@ -68,6 +79,15 @@ class Task(BaseModel):
     certainty: Certainty
     parents: list[UUID]  # uuid of tasks
     children: list[UUID]  # uuid of tastks
+
+
+class TaskPatch(BaseModel):
+    task_name: str | None = None
+    task_description: str | None = None
+    expected_date: date | None = None
+    certainty: Certainty | None = None
+    parents: list[UUID] | None = None
+    children: list[UUID] | None = None
 
 
 class Board(BaseModel):
@@ -103,15 +123,45 @@ def get_tasks_from_board(board_id: UUID):
 def put_board(new_board: Board):
     try:
         all_boards = read_boards_from_db()
-        for board in all_boards:
-            if new_board.board_id == board.board_id:
-                board.board_tasks.extend(new_board.board_tasks)
-                board.board_tasks = list(set(board.board_tasks))  # filter out dupes
-            else:
-                all_boards.append(new_board)
+        existing = next(
+            (b for b in all_boards if b.board_id == new_board.board_id), None
+        )
+        if existing is None:
+            all_boards.append(new_board)
+        else:
+            known_ids = {t.task_id for t in existing.board_tasks}
+            existing.board_tasks.extend(
+                t for t in new_board.board_tasks if t.task_id not in known_ids
+            )
         write_boards_to_db(all_boards)
     except Exception as e:
         print(f"error! {e}")
+
+
+class BoardPatch(BaseModel):
+    board_name: str | None = None
+
+
+@app.patch("/boards/{board_id}")
+def patch_board(board_id: UUID, patch: BoardPatch):
+    all_boards = read_boards_from_db()
+    for board in all_boards:
+        if board.board_id == board_id:
+            if patch.board_name is not None:
+                board.board_name = patch.board_name
+            write_boards_to_db(all_boards)
+            return {"boardId": board.board_id, "boardName": board.board_name}
+    raise HTTPException(status_code=404, detail="board not found")
+
+
+@app.delete("/boards/{board_id}")
+def delete_board(board_id: UUID):
+    all_boards = read_boards_from_db()
+    remaining = [b for b in all_boards if b.board_id != board_id]
+    if len(remaining) == len(all_boards):
+        raise HTTPException(status_code=404, detail="board not found")
+    write_boards_to_db(remaining)
+    return {"deleted": board_id}
 
 
 @app.put("/{board_id}/tasks")
@@ -127,9 +177,25 @@ def put_task(board_id: UUID, task: Task):
         print(f"error! {e}")
 
 
+@app.patch("/{board_id}/tasks/{task_id}")
+def patch_task(board_id: UUID, task_id: UUID, patch: TaskPatch):
+    all_boards = read_boards_from_db()
+    for board in all_boards:
+        if board.board_id != board_id:
+            continue
+        for i, task in enumerate(board.board_tasks):
+            if task.task_id == task_id:
+                updated = task.model_copy(update=patch.model_dump(exclude_unset=True))
+                board.board_tasks[i] = updated
+                write_boards_to_db(all_boards)
+                return updated
+    raise HTTPException(status_code=404, detail="task not found")
+
+
 @app.put("/{board_id}/query")
 async def query_natural_language(board_id: UUID, query: str):
 
+    print(query, board_id)
     current_board = None
     for board in read_boards_from_db():
         if board.board_id == board_id:
@@ -148,7 +214,7 @@ async def query_natural_language(board_id: UUID, query: str):
         """Returns a specific task's description by the name"""
         for task in current_board.board_tasks:
             if task.task_name == name:
-                return task.task_description
+                return f"Expected by: {task.expected_date}. Description: {task.task_description}"
         return "ERR: couldn't find task with that name!"
 
     @function_tool
@@ -183,6 +249,8 @@ async def query_natural_language(board_id: UUID, query: str):
         that are too vague, don't relate to the current project, or have an unclear answer should be flagged
         to the user. If the user asks for timeline questions, answer with conservative responses (i.e. if you think
         a task will take a week, tell the user it'll take a week in a half instead.)
+        ALWAYS get a list of the task names before answering the question.
+        Assume that if a user is talking about a project, they mean all of the tasks in the current board.
         """,
         model=OpenAIChatCompletionsModel(model=model, openai_client=client),
         tools=[

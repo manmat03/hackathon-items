@@ -1,0 +1,13 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "azure-identity>=1.26.0",
+    "dotenv>=0.9.9",
+    "fastapi[pydantic,standard]>=0.142.2",
+    "openai>=3.23.0",
+    "openai-agents>=0.22.3",
+]

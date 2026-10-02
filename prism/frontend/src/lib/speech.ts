@@ -16,15 +16,139 @@ export const sttSupported = () =>
   typeof window !== "undefined" &&
   !!(window.SpeechRecognition || window.webkitSpeechRecognition);
 
+/* ---------------- Lumo voice selection ----------------
+ *
+ * Browser speechSynthesis exposes a list of installed voices via
+ * speechSynthesis.getVoices(). The list is empty until the voiceschanged
+ * event fires (Chrome quirk), and the names vary wildly across OS and
+ * browser combinations. We score every voice against what Lumo should
+ * sound like — soft, warm, calm, English — and pick the best one.
+ *
+ * Preference order (highest score wins):
+ *   1. Known great Siri / Microsoft Natural / Google Studio voices
+ *   2. Any voice whose name mentions Premium / Enhanced / Natural / Neural
+ *   3. Any en-US / en-GB / en-AU female-leaning voice by common name
+ *   4. The system default
+ *
+ * Known-bad voices (novelty, deep-male defaults) are explicitly deranked
+ * so Lumo never ends up as Alex or Fred by accident.
+ */
+
+const PREFERRED_NAMES = [
+  // macOS Siri — premium quality
+  "Ava (Premium)", "Ava (Enhanced)", "Ava",
+  "Zoe (Premium)", "Zoe (Enhanced)", "Zoe",
+  "Allison (Premium)", "Allison (Enhanced)", "Allison",
+  "Serena (Premium)", "Serena (Enhanced)", "Serena",
+  "Nicky (Premium)", "Nicky (Enhanced)", "Nicky",
+  // Microsoft Edge natural voices
+  "Microsoft Jenny Online (Natural) - English (United States)",
+  "Microsoft Aria Online (Natural) - English (United States)",
+  "Microsoft Libby Online (Natural) - English (United Kingdom)",
+  // Google Chrome cloud voices
+  "Google UK English Female",
+  "Google US English",
+  // Reasonable standard-quality fallbacks
+  "Samantha", "Karen", "Fiona", "Tessa", "Moira",
+];
+
+const BAD_NAME_FRAGMENTS = [
+  "alex", "daniel", "fred", "ralph", "bruce", "bells", "zarvox",
+  "trinoids", "whisper", "bubbles", "deranged", "cellos", "pipe organ",
+  "princess", "boing", "bahh", "junior", "kathy", "good news", "bad news",
+  "hysterical", "albert", "superstar", "jester",
+];
+
+let voiceCache: SpeechSynthesisVoice | null | undefined;
+
+function scoreVoice(v: SpeechSynthesisVoice): number {
+  const name = v.name.toLowerCase();
+  if (BAD_NAME_FRAGMENTS.some((bad) => name.includes(bad))) return -1000;
+
+  let score = 0;
+  const lang = v.lang.toLowerCase();
+
+  // Language preference
+  if (lang.startsWith("en-us")) score += 50;
+  else if (lang.startsWith("en-gb")) score += 45;
+  else if (lang.startsWith("en-au")) score += 35;
+  else if (lang.startsWith("en-")) score += 25;
+  else return -500; // non-English voices are out
+
+  // Quality tier markers
+  if (/\b(premium|neural|natural|studio|wavenet)\b/i.test(v.name)) score += 60;
+  if (/\benhanced\b/i.test(v.name)) score += 40;
+
+  // Explicit preference list
+  const prefIdx = PREFERRED_NAMES.findIndex(
+    (n) => n.toLowerCase() === name
+  );
+  if (prefIdx >= 0) score += 200 - prefIdx;
+
+  // Local voices are more reliable than network voices for a demo
+  if (v.localService) score += 5;
+
+  return score;
+}
+
+export function pickLumoVoice(): SpeechSynthesisVoice | null {
+  if (voiceCache !== undefined) return voiceCache;
+  if (!ttsSupported()) {
+    voiceCache = null;
+    return null;
+  }
+  const voices = window.speechSynthesis.getVoices();
+  if (voices.length === 0) {
+    // Not ready yet; caller should retry after the voiceschanged event.
+    return null;
+  }
+  const scored = voices
+    .map((v) => ({ v, s: scoreVoice(v) }))
+    .filter((x) => x.s > -500)
+    .sort((a, b) => b.s - a.s);
+
+  voiceCache = scored.length > 0 ? scored[0].v : voices[0] ?? null;
+  return voiceCache;
+}
+
+/** Called once at app startup to warm the voice cache. Safe to re-call. */
+export function initLumoVoice(): void {
+  if (!ttsSupported()) return;
+  const resolve = () => {
+    voiceCache = undefined;
+    pickLumoVoice();
+  };
+  // Trigger a getVoices() so Chrome kicks off the "voiceschanged" event.
+  window.speechSynthesis.getVoices();
+  window.speechSynthesis.addEventListener("voiceschanged", resolve, {
+    once: true,
+  });
+  // Many browsers already have voices ready; try now too.
+  resolve();
+}
+
+function applyLumoVoice(utter: SpeechSynthesisUtterance): void {
+  const chosen = pickLumoVoice();
+  if (chosen) {
+    utter.voice = chosen;
+    utter.lang = chosen.lang;
+  } else {
+    utter.lang = "en-US";
+  }
+  // Lumo tone: a hair slower than default, pitch very slightly below neutral
+  // for warmth without going masculine.
+  utter.rate = 0.95;
+  utter.pitch = 0.95;
+  utter.volume = 1.0;
+}
+
 export function speak(text: string, onEnd?: () => void): () => void {
   if (!ttsSupported() || !text.trim()) {
     onEnd?.();
     return () => {};
   }
   const utter = new SpeechSynthesisUtterance(text);
-  utter.rate = 0.98;
-  utter.pitch = 1.0;
-  utter.lang = "en-US";
+  applyLumoVoice(utter);
   utter.onend = () => onEnd?.();
   window.speechSynthesis.cancel();
   window.speechSynthesis.speak(utter);
@@ -53,9 +177,7 @@ export function streamingSpeaker(onComplete?: () => void) {
     const text = sentence.trim();
     if (!text) return;
     const utter = new SpeechSynthesisUtterance(text);
-    utter.rate = 0.98;
-    utter.pitch = 1.0;
-    utter.lang = "en-US";
+    applyLumoVoice(utter);
     inFlight++;
     utter.onend = () => {
       inFlight--;

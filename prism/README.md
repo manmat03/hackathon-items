@@ -4,6 +4,107 @@ A voice conversation with Lumo that becomes a staffing-ready reading of someone'
 
 **Status**: MVP branch `prism-mvp`. Visual direction locked, voice loop built, backend streaming endpoint built. Needs Azure OpenAI credentials to run against the real LLM; a `?mock=1` flag runs the whole UI end-to-end without them.
 
+---
+
+## Day 1 — Get it to a working MVP
+
+Everything is built; this is the ordered path from a fresh clone to "the voice loop works end-to-end against the real Azure LLM." Expect 30–60 minutes if the Azure values are already in hand.
+
+### Step 1 — Pull the branch
+```sh
+git checkout prism-mvp
+git pull
+```
+
+### Step 2 — Backend setup
+
+**Prereqs**: Python ≥ 3.13 and [uv](https://docs.astral.sh/uv/). Install uv with `curl -LsSf https://astral.sh/uv/install.sh | sh` if you don't have it.
+
+```sh
+cd prism/backend
+uv sync
+cp .sample.env .env
+```
+
+Open `.env` and fill these values. They come from the **Protiviti Azure OpenAI gateway**, not from a plain Azure portal — the subscription/auth headers are gateway-specific. If you have access to the Constellation project's `.env` (sibling folder in this repo), **it uses the same gateway and the same values will work here**.
+
+| Variable | What goes here | How to find it |
+|---|---|---|
+| `BASE_URL` | The Azure OpenAI endpoint, e.g. `https://<gateway-host>/openai` | Protiviti IT or whoever provisioned your gateway access |
+| `API_VERSION` | A valid Azure OpenAI API version string, e.g. `2024-08-01-preview` | Latest supported by the gateway |
+| `SUBSCRIPTION_HEADER` | The HTTP header name the gateway uses to accept your subscription key, e.g. `Ocp-Apim-Subscription-Key` | Gateway docs |
+| `SUBSCRIPTION_KEY` | The actual subscription key value | Gateway admin / portal |
+| `AUTHENTICATION_TYPE_HEADER` | Header name the gateway uses to select auth type | Gateway docs |
+| `AUTHENTICATION_TYPE_VALUE` | Its value (usually something like `AAD` or `BearerToken`) | Gateway docs |
+| `TENANT_ID` | Azure AD tenant ID | Azure portal → Microsoft Entra ID → Tenant properties |
+| `CLIENT_ID` | Azure AD application (client) ID with permission to call the gateway | App registration in Entra ID |
+| `TOKEN_SCOPE` | The scope URI, usually `api://<guid>/.default` | App registration → API permissions |
+
+**Confirm the model deployment name.** `main.py` has `model = "gpt-4-1-20250414-gs"`. That's the exact Azure deployment name on the Protiviti gateway for GPT-4.1. If your deployment uses a different name (or if the gateway has moved to a newer GPT-4.1 revision), change this one line.
+
+### Step 3 — Boot the backend
+```sh
+uv run uvicorn main:app --reload
+```
+Expected: server listening on http://127.0.0.1:8000. **The first request from the frontend** will pop up a browser window asking you to sign in with Azure AD (`InteractiveBrowserCredential`). Sign in with your Protiviti account. This only happens once per server run.
+
+Quick smoke test from another terminal:
+```sh
+curl -X POST http://127.0.0.1:8000/interview/stream \
+  -H "Content-Type: application/json" \
+  -d '{"messages": []}'
+```
+You should see a trickle of `data: {"type":"token","text":"..."}` events as Lumo generates its opener, then `data: {"type":"done","wrap_up":false}`. If you see 401 → token issue. If 404 → the model deployment name in `main.py` doesn't match the gateway. If a hang → the AAD popup is probably waiting for you.
+
+### Step 4 — Frontend setup
+```sh
+cd prism/frontend
+npm install
+npm run dev
+```
+Expected: Vite dev server on http://localhost:5173.
+
+### Step 5 — Click through the loop (the real test)
+Open **http://localhost:5173** in Chrome, Safari, or Edge (Firefox falls back to a textarea; works but not voice).
+
+1. Welcome screen renders with the big navy Lumo orb.
+2. Click **Begin** → Interview screen loads, Lumo starts speaking the opener out loud.
+3. Browser prompts for mic access → **allow**.
+4. After Lumo finishes, the orb label changes to `Lumo · listening`.
+5. Speak any answer, pause ~1.5 s.
+6. Lumo responds with a follow-up in your own words.
+7. After roughly 6–10 turns Lumo wraps and you land on Results with the horizon chart.
+
+**If any step fails**: start with the "First-time failure modes" section below.
+
+### Step 6 — Tune Lumo
+
+Once the loop works end-to-end, two things to tune:
+
+- **Prompt** (`LUMO_SYSTEM_PROMPT` in `prism/backend/main.py`) — listen to a full conversation. If Lumo asks dumb follow-ups, repeats questions, or sounds HR-robotic, edit the prompt. It's the single highest-leverage knob.
+- **Voice** (automatic in `prism/frontend/src/lib/speech.ts`) — if Lumo sounds nasal or robotic on your machine, download the Premium Siri voices on macOS (System Settings → Accessibility → Spoken Content → Manage Voices → download Ava Premium or Zoe Premium). The voice picker will auto-prefer them. Alternatively, see the "What needs to be built" section for the cloud-TTS path.
+
+That's MVP. Everything else in the "What needs to be built" section further down is a stretch target, not a blocker.
+
+### First-time failure modes
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Backend 401 / "token acquired for wrong audience" | `TOKEN_SCOPE` wrong, or AAD app lacks permission | Verify scope matches the gateway's expected `api://<guid>/.default` |
+| Backend 404 on model | `model` string in main.py doesn't match the gateway's deployment | Change `model = "..."` to the exact deployment name |
+| Backend hangs on first call | AAD popup is waiting; you missed the browser window | Look for the sign-in tab, complete it |
+| Frontend CORS error | Backend running on something other than :8000 or :5173 origin changed | CORS allow list in main.py currently covers `http://localhost:5173` and `http://127.0.0.1:5173` — add other origins there |
+| Mic permission not asked | Running over `http://` on a non-localhost origin | Use `localhost` or set up HTTPS; mic APIs require secure context |
+| Lumo doesn't speak out loud | OS audio off, or Chrome tab muted | Check tab mute icon, OS volume |
+| STT returns nothing | Mic muted, or browser is Firefox | Allow mic; use Chrome/Safari/Edge, or type into the fallback textarea |
+| Results screen is blank | `/eval` returned an error — check backend logs | Usually prompt-injection or malformed input; test with the mock first |
+
+### Can't get Azure yet?
+
+Open **http://localhost:5173/?mock=1** — the whole UI runs with a hardcoded 6-turn Lumo script and hardcoded skill scores. Zero backend calls. Useful for working on the UI, demoing the flow, or verifying everything but Azure before the keys arrive.
+
+---
+
 ## For the engineer picking this up
 
 ### What's here

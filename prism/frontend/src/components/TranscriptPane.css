@@ -21,7 +21,9 @@
 
 .transcript-scroll {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 14px 18px 20px;
   display: flex;
   flex-direction: column;

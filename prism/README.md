@@ -135,7 +135,7 @@ prism/
 | Endpoint | Shape | Status |
 |---|---|---|
 | `POST /interview/stream` | Takes `{messages: [{role: "lumo" \| "user", content: string}]}`. Streams Lumo's next utterance as Server-Sent Events: `data: {"type":"token","text":"..."}` per chunk, then `data: {"type":"done","wrap_up":bool}`. Uses Azure OpenAI chat completions streaming. System prompt in `LUMO_SYSTEM_PROMPT`. | **Built, needs Azure creds to run.** |
-| `GET /eval?work_description=...` | Scores one text paragraph against all 14 skills via `client.responses.parse` with structured output. Returns the full `SkillList`. Fix for the "doesn't return" bug is applied. | **Built, needs Azure creds.** |
+| `PUT /eval` | Takes a JSON body `{"work_description": string}`. Scores one text paragraph against all 14 skills via `client.responses.parse` with structured output. Returns the full `SkillList`. Fix for the "doesn't return" bug is applied. | **Built, needs Azure creds.** |
 | `GET /skills` | Returns the saved pickle. Seeds a default list on first read (fix applied). | **Built, needs Azure creds only for the first write via `/eval`.** |
 | `PATCH /skills?skill_name=&skill_level=` | Bumps one skill. Still has a latent bug: reads `skill.level` but the model field is `score`. Not used by the current UI. | **Known bug, not blocking.** |
 

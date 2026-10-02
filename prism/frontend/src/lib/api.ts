@@ -35,10 +35,18 @@ export async function evalDescription(description: string): Promise<SkillList> {
   if (mockMode()) {
     return mockEval(description);
   }
-  const url = new URL(`${BASE}/eval`);
-  url.searchParams.set("work_description", description);
-  const res = await fetch(url.toString(), { method: "GET" });
-  if (!res.ok) throw new Error(`eval failed: ${res.status} ${res.statusText}`);
+  const res = await fetch(`${BASE}/eval`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ work_description: description }),
+  });
+  if (!res.ok) {
+    const detail = await res
+      .json()
+      .then((b) => b?.detail)
+      .catch(() => null);
+    throw new Error(`eval failed: ${res.status} ${detail ?? res.statusText}`);
+  }
   const data = (await res.json()) as SkillList;
   if (!data || !Array.isArray(data.skills)) {
     throw new Error("eval returned an unexpected shape");
@@ -97,7 +105,34 @@ export async function* streamInterviewNext(
 export const END_SENTINEL = "[END_INTERVIEW]";
 
 export function stripEndSentinel(text: string): string {
-  return text.replace(END_SENTINEL, "").trim();
+  return text.split(END_SENTINEL).join("").trim();
+}
+
+/** Removes END_SENTINEL from a token stream even when it is split across
+ *  chunks. Any trailing text that could still become the sentinel is held
+ *  back until the next push or flush. */
+export function createSentinelStripper() {
+  let pending = "";
+  return {
+    push(chunk: string): string {
+      pending = (pending + chunk).split(END_SENTINEL).join("");
+      let hold = 0;
+      for (let k = Math.min(pending.length, END_SENTINEL.length - 1); k > 0; k--) {
+        if (END_SENTINEL.startsWith(pending.slice(-k))) {
+          hold = k;
+          break;
+        }
+      }
+      const out = pending.slice(0, pending.length - hold);
+      pending = pending.slice(pending.length - hold);
+      return out;
+    },
+    flush(): string {
+      const out = pending.split(END_SENTINEL).join("");
+      pending = "";
+      return out;
+    },
+  };
 }
 
 /* ---------------- Mock mode ---------------- */

@@ -22,7 +22,7 @@ Lumo runs a continuous, Gemini-style voice conversation. There is no scripted qu
 3. The user's transcribed answer is appended to the local history and sent back to `/interview/stream` for Lumo's next turn.
 4. A soft transcript pane on the right shows the full running conversation — purely a trust-building display, not a confirmation step.
 5. The backend LLM decides when to wrap up (coverage across the 14 skill areas or a soft turn cap) and emits a `[END_INTERVIEW]` sentinel on its final message. The sentinel is stripped before display and TTS; the frontend sees it in the stream's `done` event and transitions to finalize.
-6. Finalize concatenates every Q/A pair into one paragraph and calls `GET /eval`, which returns the 14 skill scores. The results screen renders them.
+6. Finalize concatenates every Q/A pair into one paragraph and calls `PUT /eval` with a JSON body `{"work_description": ...}`, which returns the 14 skill scores. The results screen renders them.
 
 The user can hit **Wrap up →** at any time to end early.
 
@@ -30,7 +30,7 @@ The user can hit **Wrap up →** at any time to end early.
 
 - Full voice loop: STT → LLM streaming → sentence-chunked TTS.
 - Backend `POST /interview/stream` using Azure OpenAI gpt-4.1 with streaming chat completions.
-- Backend `GET /eval` for the final 14-skill scoring.
+- Backend `PUT /eval` for the final 14-skill scoring.
 - Soft transcript pane as the trust-building display.
 
 ## Still mocked, for a future pass

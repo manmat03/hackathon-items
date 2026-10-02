@@ -3,6 +3,7 @@ import { useNavigate } from "@solidjs/router";
 import { Lumo, LumoState } from "../components/Lumo";
 import { TranscriptPane } from "../components/TranscriptPane";
 import {
+  createSentinelStripper,
   END_SENTINEL,
   evalDescription,
   historyToWorkDescription,
@@ -88,20 +89,24 @@ const Interview: Component = () => {
       }
     });
 
+    const stripper = createSentinelStripper();
+    let visible = "";
+    const emit = (text: string) => {
+      if (!text) return;
+      visible += text;
+      setLiveLumo(visible.trim());
+      speaker?.push(text);
+    };
+
     try {
       for await (const ev of streamInterviewNext(history())) {
         if (cancelled) return;
         if (ev.type === "token") {
           full += ev.text;
-          const visible = stripEndSentinel(full);
-          setLiveLumo(visible);
-          // Feed the speaker a safe (sentinel-free) stream.
-          const safeDelta = ev.text.includes(END_SENTINEL)
-            ? ev.text.replace(END_SENTINEL, "")
-            : ev.text;
-          speaker.push(safeDelta);
+          emit(stripper.push(ev.text));
         } else if (ev.type === "done") {
-          wrapUp = ev.wrap_up;
+          wrapUp = ev.wrap_up || full.includes(END_SENTINEL);
+          emit(stripper.flush());
           speaker.finish();
         } else if (ev.type === "error") {
           throw new Error(ev.message);

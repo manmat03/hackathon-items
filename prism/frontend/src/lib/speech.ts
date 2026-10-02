@@ -171,7 +171,15 @@ export function streamingSpeaker(onComplete?: () => void) {
 
   let buffer = "";
   let finished = false;
+  let cancelled = false;
+  let completed = false;
   let inFlight = 0;
+
+  const complete = () => {
+    if (completed || cancelled) return;
+    completed = true;
+    onComplete?.();
+  };
 
   const flushSentence = (sentence: string) => {
     const text = sentence.trim();
@@ -179,11 +187,16 @@ export function streamingSpeaker(onComplete?: () => void) {
     const utter = new SpeechSynthesisUtterance(text);
     applyLumoVoice(utter);
     inFlight++;
-    utter.onend = () => {
+    // Browsers may fire both onerror and onend for one utterance.
+    let settled = false;
+    const settle = () => {
+      if (settled) return;
+      settled = true;
       inFlight--;
-      if (finished && inFlight === 0) onComplete?.();
+      if (finished && inFlight === 0) complete();
     };
-    utter.onerror = utter.onend;
+    utter.onend = settle;
+    utter.onerror = settle;
     window.speechSynthesis.speak(utter);
   };
 
@@ -212,9 +225,10 @@ export function streamingSpeaker(onComplete?: () => void) {
         flushSentence(buffer);
         buffer = "";
       }
-      if (inFlight === 0) onComplete?.();
+      if (inFlight === 0) complete();
     },
     cancel() {
+      cancelled = true;
       finished = true;
       buffer = "";
       window.speechSynthesis.cancel();

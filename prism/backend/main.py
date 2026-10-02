@@ -6,7 +6,7 @@ from typing import Literal
 
 from azure.identity import InteractiveBrowserCredential, get_bearer_token_provider
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openai import AsyncAzureOpenAI, AzureOpenAI
@@ -102,6 +102,16 @@ Ending:
 - Emit [END_INTERVIEW] only in the final message, never earlier."""
 
 
+END_SENTINEL = "[END_INTERVIEW]"
+
+
+def held_sentinel_prefix_len(text: str) -> int:
+    for k in range(min(len(text), len(END_SENTINEL) - 1), 0, -1):
+        if END_SENTINEL.startswith(text[-k:]):
+            return k
+    return 0
+
+
 class InterviewMessage(BaseModel):
     role: Literal["lumo", "user"]
     content: str
@@ -132,23 +142,38 @@ def get_user_skills():
     return load_current_skills()
 
 
-@app.get("/eval")
-def eval_description(work_description: str):
-    res = client.responses.parse(
-        instructions="""Using the user's work experience,
-        fill out the given skill list with an estimated skill level.
-        0 = No experience,
-        1 = Learning only,
-        2 = Extremely Basic Real-world experience,
-        3 = Basic Real-world experience,
-        4 = Intermediate Real-world experience,
-        5 = expert-level Real-world experience.""",
-        input=work_description,
-        text_format=SkillList,
-    )
-    updated_list = res.output_parsed
+EVAL_INSTRUCTIONS = """Using the user's work experience,
+fill out the given skill list with an estimated skill level.
+0 = No experience,
+1 = Learning only,
+2 = Extremely Basic Real-world experience,
+3 = Basic Real-world experience,
+4 = Intermediate Real-world experience,
+5 = expert-level Real-world experience."""
+
+
+class EvalRequest(BaseModel):
+    work_description: str
+
+
+@app.put("/eval")
+def eval_description(req: EvalRequest):
+    # Unhandled exceptions become a bare 500 outside CORSMiddleware, which the
+    # browser reports as a CORS failure; HTTPException keeps the CORS headers.
+    try:
+        res = client.chat.completions.parse(
+            model=model,
+            messages=[
+                {"role": "system", "content": EVAL_INSTRUCTIONS},
+                {"role": "user", "content": req.work_description},
+            ],
+            response_format=SkillList,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"eval LLM call failed: {e}")
+    updated_list = res.choices[0].message.parsed
     if updated_list is None:
-        raise ValueError()
+        raise HTTPException(status_code=502, detail="eval returned no parsed skills")
     write_skills(updated_list.skills)
     return updated_list
 
@@ -186,8 +211,12 @@ async def interview_stream(history: InterviewHistory):
         role = "assistant" if m.role == "lumo" else "user"
         messages.append({"role": role, "content": m.content})
 
+    def token_event(text: str) -> str:
+        return f"data: {json.dumps({'type': 'token', 'text': text})}\n\n"
+
     async def gen():
         collected = ""
+        pending = ""
         try:
             stream = await async_client.chat.completions.create(
                 model=model,
@@ -202,14 +231,24 @@ async def interview_stream(history: InterviewHistory):
                 if not delta:
                     continue
                 collected += delta
-                payload = json.dumps({"type": "token", "text": delta})
-                yield f"data: {payload}\n\n"
+                # The sentinel can arrive split across chunks, so hold back any
+                # tail that might still turn into it.
+                pending = (pending + delta).replace(END_SENTINEL, "")
+                hold = held_sentinel_prefix_len(pending)
+                ready = pending[: len(pending) - hold]
+                pending = pending[len(pending) - hold :]
+                if ready:
+                    yield token_event(ready)
         except Exception as e:
             err = json.dumps({"type": "error", "message": str(e)})
             yield f"data: {err}\n\n"
             return
 
-        wrap_up = "[END_INTERVIEW]" in collected
+        tail = pending.replace(END_SENTINEL, "")
+        if tail:
+            yield token_event(tail)
+
+        wrap_up = END_SENTINEL in collected
         final = json.dumps({"type": "done", "wrap_up": wrap_up})
         yield f"data: {final}\n\n"
 

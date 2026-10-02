@@ -1,11 +1,15 @@
+import json
 import os
 import pickle
 from enum import Enum
+from typing import Literal
 
 from azure.identity import InteractiveBrowserCredential, get_bearer_token_provider
 from dotenv import load_dotenv
-from fastapi import FastAPI
-from openai import AzureOpenAI
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from openai import AsyncAzureOpenAI, AzureOpenAI
 from pydantic import BaseModel
 
 
@@ -64,9 +68,66 @@ client = AzureOpenAI(
     },
 )
 
+async_client = AsyncAzureOpenAI(
+    api_version=api_version,
+    azure_endpoint=base_url,  # type: ignore
+    azure_ad_token_provider=token_provider,
+    default_headers={  # type: ignore
+        subscription_header: subscription_key,
+        authentication_type_header: authentication_type_value,
+    },
+)
+
 model = "gpt-4-1-20250414-gs"
 
+
+LUMO_SYSTEM_PROMPT = """You are Lumo, a warm and curious interviewer running a short, natural conversation with a consultant about their recent work. The point of the conversation is to collect real signal across these 14 skill areas, which you NEVER mention or list to the user — they are your private coverage goal:
+
+Next Gen TechOps · Risk Assessments · Security / Cybersecurity · Selection, Design, and Architecture · System Implementation / SDLC · Technology Frameworks, Standards and Regulations · Business Continuity Management · Cloud · Data (Governance & Privacy) · Development · IT Controls and IPE · IT Department Governance · IT Service Management & Delivery · Networking (Operations)
+
+Conversation rules:
+- Keep every turn to 1–2 sentences. Short, spoken, natural — not written.
+- Ask ONE question per turn. Never stacked, never numbered, never "topic X / topic Y".
+- When an answer is short, vague, or missing a specific example, follow up in the person's own words: "tell me more about that landing zone", "walk me through the cutover", "what made the controls walkthrough tricky". Mirror their nouns.
+- When a topic is sufficiently covered, transition naturally: "okay, switching gears — ..." or "that's helpful; on another note, ...". Never say you're moving to the next question.
+- Never say "question X of Y", "let me ask", "let's unpack", "I appreciate you sharing", or any HR-speak. Warm, direct, curious — like a smart colleague over coffee.
+- Never list the skill areas, never explain scoring, never promise a report.
+
+Opening:
+- The conversation history may be empty. If it is, your first message is a short warm opener, roughly: "Hi, I'm Lumo. So — what have you been working on lately?" You can vary the wording; keep it human and short.
+
+Ending:
+- When you have real, specific signal across at least 6–7 of the 14 skill areas (concrete examples, not just mentions), wrap up with one short appreciation + one closing sentence, and append the exact sentinel [END_INTERVIEW] at the very end of that message. The sentinel is stripped before the user sees it.
+- Soft cap: if the conversation reaches ~20 user turns, wrap on the next natural opening even if coverage is light.
+- Emit [END_INTERVIEW] only in the final message, never earlier."""
+
+
+END_SENTINEL = "[END_INTERVIEW]"
+
+
+def held_sentinel_prefix_len(text: str) -> int:
+    for k in range(min(len(text), len(END_SENTINEL) - 1), 0, -1):
+        if END_SENTINEL.startswith(text[-k:]):
+            return k
+    return 0
+
+
+class InterviewMessage(BaseModel):
+    role: Literal["lumo", "user"]
+    content: str
+
+
+class InterviewHistory(BaseModel):
+    messages: list[InterviewMessage]
+
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def main():
@@ -81,24 +142,40 @@ def get_user_skills():
     return load_current_skills()
 
 
-@app.get("/eval")
-def eval_description(work_description: str):
-    res = client.responses.parse(
-        instructions="""Using the user's work experience,
-        fill out the given skill list with an estimated skill level.
-        0 = No experience,
-        1 = Learning only,
-        2 = Extremely Basic Real-world experience,
-        3 = Basic Real-world experience,
-        4 = Intermediate Real-world experience,
-        5 = expert-level Real-world experience.""",
-        input=work_description,
-        text_format=SkillList,
-    )
-    updated_list = res.output_parsed
+EVAL_INSTRUCTIONS = """Using the user's work experience,
+fill out the given skill list with an estimated skill level.
+0 = No experience,
+1 = Learning only,
+2 = Extremely Basic Real-world experience,
+3 = Basic Real-world experience,
+4 = Intermediate Real-world experience,
+5 = expert-level Real-world experience."""
+
+
+class EvalRequest(BaseModel):
+    work_description: str
+
+
+@app.put("/eval")
+def eval_description(req: EvalRequest):
+    # Unhandled exceptions become a bare 500 outside CORSMiddleware, which the
+    # browser reports as a CORS failure; HTTPException keeps the CORS headers.
+    try:
+        res = client.chat.completions.parse(
+            model=model,
+            messages=[
+                {"role": "system", "content": EVAL_INSTRUCTIONS},
+                {"role": "user", "content": req.work_description},
+            ],
+            response_format=SkillList,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"eval LLM call failed: {e}")
+    updated_list = res.choices[0].message.parsed
     if updated_list is None:
-        raise ValueError()
+        raise HTTPException(status_code=502, detail="eval returned no parsed skills")
     write_skills(updated_list.skills)
+    return updated_list
 
 
 def update_user_skill(skill_name: str, skill_level: int):
@@ -118,6 +195,64 @@ def update_user_skill(skill_name: str, skill_level: int):
 @app.patch("/skills")
 def update_skill(skill_name: str, skill_level: int):
     update_user_skill(skill_name, skill_level)
+
+
+@app.post("/interview/stream")
+async def interview_stream(history: InterviewHistory):
+    """Streams Lumo's next utterance as Server-Sent Events.
+
+    Each event payload is JSON: {"type": "token", "text": "..."} for each
+    token chunk, then a final {"type": "done", "wrap_up": bool} where
+    wrap_up is true iff Lumo emitted the [END_INTERVIEW] sentinel.
+    """
+
+    messages: list[dict] = [{"role": "system", "content": LUMO_SYSTEM_PROMPT}]
+    for m in history.messages:
+        role = "assistant" if m.role == "lumo" else "user"
+        messages.append({"role": role, "content": m.content})
+
+    def token_event(text: str) -> str:
+        return f"data: {json.dumps({'type': 'token', 'text': text})}\n\n"
+
+    async def gen():
+        collected = ""
+        pending = ""
+        try:
+            stream = await async_client.chat.completions.create(
+                model=model,
+                messages=messages,  # type: ignore
+                stream=True,
+                temperature=0.8,
+            )
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta.content
+                if not delta:
+                    continue
+                collected += delta
+                # The sentinel can arrive split across chunks, so hold back any
+                # tail that might still turn into it.
+                pending = (pending + delta).replace(END_SENTINEL, "")
+                hold = held_sentinel_prefix_len(pending)
+                ready = pending[: len(pending) - hold]
+                pending = pending[len(pending) - hold :]
+                if ready:
+                    yield token_event(ready)
+        except Exception as e:
+            err = json.dumps({"type": "error", "message": str(e)})
+            yield f"data: {err}\n\n"
+            return
+
+        tail = pending.replace(END_SENTINEL, "")
+        if tail:
+            yield token_event(tail)
+
+        wrap_up = END_SENTINEL in collected
+        final = json.dumps({"type": "done", "wrap_up": wrap_up})
+        yield f"data: {final}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 def gen_default_skill_list() -> list[Skill]:
@@ -141,8 +276,13 @@ def gen_default_skill_list() -> list[Skill]:
 
 
 def load_current_skills(filename="current_skills.pkl"):
-    with open(filename, "rb") as f:
-        return pickle.load(f)
+    try:
+        with open(filename, "rb") as f:
+            return pickle.load(f)
+    except FileNotFoundError:
+        seed = gen_default_skill_list()
+        write_skills(seed, filename=filename)
+        return seed
 
 
 def write_skills(skills: list[Skill], filename="current_skills.pkl"):
